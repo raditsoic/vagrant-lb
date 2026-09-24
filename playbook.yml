@@ -1,0 +1,60 @@
+---
+- name: Common setup on all machines
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Ensure nginx is running and enabled at boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+- name: Configure web servers
+  hosts: webservers
+  become: true
+  tasks:
+    - name: Deploy index page showing which server answered
+      ansible.builtin.template:
+        src: templates/index.html.j2
+        dest: /var/www/html/index.html
+        mode: "0644"
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+- name: Configure load balancer
+  hosts: loadbalancers
+  become: true
+  tasks:
+    - name: Deploy load balancer config
+      ansible.builtin.template:
+        src: templates/loadbalancer.conf.j2
+        dest: /etc/nginx/conf.d/loadbalancer.conf
+        mode: "0644"
+      notify: restart nginx
+
+    - name: Remove default site (it would shadow our config on port 80)
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted

@@ -1,0 +1,5 @@
+# Vagrant state: machine IDs, box metadata, and per-VM SSH private keys.
+.vagrant/
+
+# Ansible retry files (older ansible-core versions)
+*.retry
