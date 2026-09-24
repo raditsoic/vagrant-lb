@@ -8,6 +8,12 @@
         update_cache: true
         cache_valid_time: 3600
 
+- name: nginx on the machines that serve HTTP
+  # Not on dbservers — db runs no web server (an older version of this
+  # playbook installed it on all hosts; the db play below removes it).
+  hosts: webservers:loadbalancers
+  become: true
+  tasks:
     - name: Install nginx
       ansible.builtin.apt:
         name: nginx
@@ -19,28 +25,204 @@
         state: started
         enabled: true
 
-- name: Configure web servers
+
+- name: Configure the shared PostgreSQL database
+  hosts: dbservers
+  become: true
+  tasks:
+    - name: Install PostgreSQL, psycopg2 (driver for the Ansible modules), acl
+      # acl = setfacl, which Ansible needs to make its temp files readable
+      # when becoming the unprivileged "postgres" user below.
+      ansible.builtin.apt:
+        name: [postgresql, python3-psycopg2, acl]
+        state: present
+
+    - name: Remove nginx (older all-hosts play installed it; db serves no HTTP)
+      ansible.builtin.apt:
+        name: nginx
+        state: absent
+
+    - name: Listen on all interfaces (Debian defaults to localhost-only)
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql/{{ pg_version }}/main/postgresql.conf
+        regexp: '^#?listen_addresses\s*='
+        line: "listen_addresses = '*'"
+      notify: restart postgresql
+
+    - name: Allow the app role in from the webs and from WSL
+      # File-level edit on purpose: postgresql_pg_hba validates against a
+      # live server, but the rules must be in place before postgres accepts
+      # any remote login at all. One rule per call (users/databases are
+      # strings, not lists — a list gets written to the file literally),
+      # hence the loop. 10.0.2.2 is how WSL appears to the guest through
+      # VirtualBox's NAT port forward (the 5433 → 5432 one).
+      community.postgresql.postgresql_pg_hba:
+        dest: /etc/postgresql/{{ pg_version }}/main/pg_hba.conf
+        contype: host
+        users: "{{ tiket_db.user }}"
+        databases: "{{ tiket_db.name }}"
+        address: "{{ item }}"
+        method: scram-sha-256
+      loop:
+        - 192.168.56.0/24   # the webs, over the host-only network
+        - 10.0.2.2/32       # WSL, arriving via the NAT forward
+      notify: restart postgresql
+
+    - name: Create the app role
+      # Local socket as the postgres OS user (peer auth) — no password needed
+      # for admin work on the db host itself.
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ tiket_db.user }}"
+        password: "{{ tiket_db.password }}"
+
+    - name: Create the app database owned by the role
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: "{{ tiket_db.name }}"
+        owner: "{{ tiket_db.user }}"
+
+  handlers:
+    - name: restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+
+- name: Configure web servers (Flask app + shared PostgreSQL + nginx proxy)
   hosts: webservers
   become: true
   tasks:
-    - name: Deploy index page showing which server answered
+    - name: Install app packages
+      ansible.builtin.apt:
+        # NB: the executable is in "gunicorn"; python3-gunicorn is libs only.
+        name: [python3-flask, gunicorn, python3-psycopg2, dnsutils]
+        state: present
+
+    - name: Create app directory owned by the web server user
+      ansible.builtin.file:
+        path: /opt/tiket
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Deploy Flask app
       ansible.builtin.template:
-        src: templates/index.html.j2
-        dest: /var/www/html/index.html
+        src: templates/app.py.j2
+        dest: /opt/tiket/app.py
+        owner: www-data
+        group: www-data
+        mode: "0644"
+      notify: restart tiket-app
+
+    - name: Remove the old per-node SQLite file (state now lives in db.tiket.lab)
+      ansible.builtin.file:
+        path: /opt/tiket/visits.db
+        state: absent
+
+    - name: Install systemd unit for gunicorn
+      ansible.builtin.template:
+        src: templates/tiket-app.service.j2
+        dest: /etc/systemd/system/tiket-app.service
+        mode: "0644"
+      notify: restart tiket-app
+
+    - name: Enable and start the app
+      ansible.builtin.systemd:
+        name: tiket-app
+        state: started
+        enabled: true
+
+    - name: Deploy nginx site proxying to the app
+      ansible.builtin.template:
+        src: templates/web-site.conf.j2
+        dest: /etc/nginx/sites-available/tiket
         mode: "0644"
       notify: restart nginx
 
+    - name: Enable tiket site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/tiket
+        dest: /etc/nginx/sites-enabled/tiket
+        state: link
+      notify: restart nginx
+
+    - name: Remove default site (it would shadow our config on port 80)
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Stop dhclient from rewriting resolv.conf on lease renewal
+      # dhclient rewrites /etc/resolv.conf at every renewal with whatever
+      # resolver NAT hands out, silently dropping the lab nameservers —
+      # and then the app 500s, since it resolves db.tiket.lab on every
+      # request. This hook no-ops the resolv.conf writer; the copy below
+      # stays authoritative no matter what DHCP says.
+      ansible.builtin.copy:
+        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
+        mode: "0644"
+        content: |
+          #!/bin/sh
+          # Lab DNS is static; never let dhclient-script touch resolv.conf.
+          make_resolv_conf() { :; }
+
+    - name: Resolve via lb's dnsmasq first, NAT resolver as fallback
+      # Fallback matters: if lb is down or reloading, apt etc. still resolve.
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver {{ hostvars['lb']['private_ip'] }}
+          nameserver 10.0.2.3
+
   handlers:
+    - name: restart tiket-app
+      ansible.builtin.systemd:
+        name: tiket-app
+        state: restarted
+        daemon_reload: true
+
     - name: restart nginx
       ansible.builtin.service:
         name: nginx
         state: restarted
 
-- name: Configure load balancer
+
+- name: Configure DNS (dnsmasq) and load balancer
   hosts: loadbalancers
   become: true
   tasks:
-    - name: Deploy load balancer config
+    - name: Install dnsmasq (and dig for verification)
+      ansible.builtin.apt:
+        name: [dnsmasq, dnsutils]
+        state: present
+
+    - name: Deploy dnsmasq config for the lab domain
+      ansible.builtin.template:
+        src: templates/dnsmasq.conf.j2
+        dest: /etc/dnsmasq.d/tiket.conf
+        mode: "0644"
+      notify: restart dnsmasq
+
+    - name: Stop dhclient from rewriting resolv.conf on lease renewal
+      # Same reason as the webs: resolv.conf must stay at 127.0.0.1 or
+      # this host loses its own dnsmasq (and apt falls back to NAT).
+      ansible.builtin.copy:
+        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
+        mode: "0644"
+        content: |
+          #!/bin/sh
+          # Lab DNS is static; never let dhclient-script touch resolv.conf.
+          make_resolv_conf() { :; }
+
+    - name: Point lb's own resolver at dnsmasq
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 127.0.0.1
+
+    - name: Deploy load balancer config (backends by DNS name)
       ansible.builtin.template:
         src: templates/loadbalancer.conf.j2
         dest: /etc/nginx/conf.d/loadbalancer.conf
@@ -53,7 +235,14 @@
         state: absent
       notify: restart nginx
 
+  # Handler order matters: dnsmasq must be up before nginx restarts,
+  # because nginx resolves the upstream names at (re)start time.
   handlers:
+    - name: restart dnsmasq
+      ansible.builtin.service:
+        name: dnsmasq
+        state: restarted
+
     - name: restart nginx
       ansible.builtin.service:
         name: nginx

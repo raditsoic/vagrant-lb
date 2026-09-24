@@ -4,7 +4,7 @@
 # Re-run after every `vagrant up` that (re)creates machines.
 set -euo pipefail
 mkdir -p "$HOME/.ssh/vagrant-lab"
-for m in lb web1 web2; do
+for m in lb web1 web2 db; do
   src=".vagrant/machines/$m/virtualbox/private_key"
   [ -f "$src" ] || { echo "skip $m (no key yet)"; continue; }
   cp "$src" "$HOME/.ssh/vagrant-lab/$m"

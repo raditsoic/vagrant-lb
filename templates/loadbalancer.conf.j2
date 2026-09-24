@@ -1,6 +1,9 @@
+# Backends are resolved via the lab's dnsmasq (see dnsmasq.conf.j2).
+# nginx resolves upstream names once at start/reload — that's why the
+# dnsmasq handler must run before the nginx handler.
 upstream backend {
 {% for host in groups['webservers'] %}
-    server {{ hostvars[host]['private_ip'] }}:80;
+    server {{ host }}.{{ lab_domain }}:80;
 {% endfor %}
 }
 

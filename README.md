@@ -1,16 +1,27 @@
 # vagrant — nginx load balancer lab
 
-Three Debian 12 VMs (VirtualBox, managed by Vagrant, provisioned by Ansible):
+Four Debian 12 VMs (VirtualBox, managed by Vagrant, provisioned by Ansible):
 
-| Machine | Private IP      | Role        | NAT forward (127.0.0.1) |
-| ------- | --------------- | ----------- | ----------------------- |
-| `lb`    | `192.168.56.10` | nginx LB    | SSH `2210`, HTTP `8080` |
-| `web1`  | `192.168.56.11` | nginx web   | SSH `2211`              |
-| `web2`  | `192.168.56.12` | nginx web   | SSH `2212`              |
+| Machine | Private IP      | Role                                  | NAT forward (127.0.0.1)             |
+| ------- | --------------- | ------------------------------------- | ----------------------------------- |
+| `lb`    | `192.168.56.10` | nginx LB + dnsmasq DNS (`tiket.lab`)  | SSH `2210`, HTTP `8080`, DNS `5533` |
+| `web1`  | `192.168.56.11` | Flask app + gunicorn, nginx           | SSH `2211`, HTTP `8081`             |
+| `web2`  | `192.168.56.12` | Flask app + gunicorn, nginx           | SSH `2212`, HTTP `8082`             |
+| `db`    | `192.168.56.20` | PostgreSQL 15 (shared visits DB)      | SSH `2213`, psql `5433`             |
 
 `lb` proxies port 80 round-robin across the two webs over the private
-host-only network. Each web serves an index page identifying itself, so
-hitting the load balancer alternates between `web1` and `web2`.
+host-only network. Each web runs the **same** Flask app (under gunicorn),
+and all webs write to **one shared PostgreSQL** on `db.tiket.lab` — the
+production topology: interchangeable stateless app VMs plus a dedicated
+database VM. Responses still name the node that handled them, so hitting
+the load balancer visibly alternates between `web1` and `web2`, but the
+visit total now climbs monotonically no matter which node answers — the
+shared DB is exactly what makes the backends swappable.
+
+`lb` also runs **dnsmasq**, which serves the `tiket.lab` zone for all
+machines in the lab and forwards everything else to VirtualBox NAT's
+resolver. The webs resolve through it, and lb's nginx config uses DNS
+names (`web1.tiket.lab:80`, …) for its upstreams instead of IPs.
 
 ## Run it
 
@@ -20,16 +31,63 @@ vagrant up            # WSL vagrant — NOT vagrant.exe (see below)
 vagrant provision     # run the Ansible playbook
 ```
 
-Verify:
+Verify the app through the load balancer:
 
 ```bash
 for i in 1 2 3 4; do curl -s http://127.0.0.1:8080/ | grep -o '<h1>.*</h1>'; done
-# <h1>Hello from web1</h1>
+# <h1>Hello from web1</h1>   (each page also shows the shared visit total)
 # <h1>Hello from web2</h1>
 # ...
 ```
 
-`http://localhost:8080` also works from a Windows browser.
+Verify the shared state — the node alternates while the total keeps
+climbing across nodes, and both hosts appear in the one database:
+
+```bash
+for i in $(seq 1 6); do curl -s http://127.0.0.1:8080/ | grep -E '<h1>|shared'; done
+
+vagrant ssh db -c "sudo -u postgres psql tiketdb -c 'SELECT host, COUNT(*) FROM visits GROUP BY host;'"
+#  host  | count
+# -------+-------
+#  web1  |     3
+#  web2  |     4
+```
+
+psql straight from WSL (or Windows) through the `5433` NAT forward:
+
+```bash
+psql "host=127.0.0.1 port=5433 dbname=tiketdb user=tiket password=tiket-lab" -c '\dt'
+```
+
+Direct access to the webs (works from WSL and from a Windows browser):
+
+```bash
+curl -s http://127.0.0.1:8081/    # web1
+curl -s http://127.0.0.1:8082/    # web2
+```
+
+`http://localhost:8080` / `:8081` / `:8082` also work from a Windows
+browser.
+
+DNS — query dnsmasq from WSL (needs `dnsutils`; note the non-standard
+port, browsers/curl won't use it automatically):
+
+```bash
+dig @127.0.0.1 -p 5533 web1.tiket.lab        # → 192.168.56.11
+```
+
+Inside the lab, names resolve normally via resolv.conf:
+
+```bash
+vagrant ssh web1 -c 'curl -s http://web2.tiket.lab/ | grep h1'
+```
+
+And curl from WSL can use the hostname with `--resolve` (no /etc/hosts
+edit needed):
+
+```bash
+curl --resolve web1.tiket.lab:8081:127.0.0.1 http://web1.tiket.lab:8081/
+```
 
 ## WSL + VirtualBox: why it's set up this way
 
@@ -62,18 +120,55 @@ here, so be explicit. Mixing them also makes `.vagrant/` record conflicting
 machine paths — the "machine used to live in …" warning — which is noisy
 but harmless.
 
+## How provisioning is structured
+
+`playbook.yml` has five plays:
+
+1. **All machines** — apt cache.
+2. **webservers:loadbalancers** — nginx installed/started/enabled. Not on
+   dbservers: db runs no web server (the db play removes the one an older
+   all-hosts play left behind).
+3. **dbservers** — PostgreSQL 15 listening on all interfaces, `pg_hba`
+   rules admitting the app role from `192.168.56.0/24` (the webs) and
+   `10.0.2.2/32` (WSL via the NAT forward), plus the `tiket` role and
+   `tiketdb` database.
+4. **webservers** — Flask app + gunicorn (`/opt/tiket/app.py`, systemd unit
+   `tiket-app`; the app connects to `db.tiket.lab` over psycopg2), nginx
+   site proxying to `127.0.0.1:8000`, resolv.conf pointed at lb's dnsmasq
+   with the NAT resolver as fallback, plus a dhclient enter-hook that keeps
+   resolv.conf authoritative across DHCP renewals.
+5. **loadbalancers** — dnsmasq config for `tiket.lab`, resolv.conf at
+   `127.0.0.1`, nginx LB config with DNS-named upstreams, same dhclient
+   enter-hook.
+
+Shared values (db name/user/password, `lab_domain`, PG version) live in
+`group_vars/all.yml` because play-level vars don't cross plays.
+
+Two ordering details that matter:
+
+- On lb, handlers run **dnsmasq before nginx** — nginx resolves upstream
+  names once at start/reload, so dnsmasq must already be answering.
+- lb's dnsmasq config uses `no-resolv` + `server=10.0.2.3`, because lb's
+  own resolv.conf points at `127.0.0.1` (dnsmasq itself) — without
+  `no-resolv` it would loop trying to read its own forwarder config.
+
 ## Files
 
 | File                          | Purpose                                                        |
 | ----------------------------- | -------------------------------------------------------------- |
 | `Vagrantfile`                 | VM definitions, port forwards, WSL-aware provisioning           |
-| `playbook.yml`                | installs nginx everywhere, configures webs + lb                  |
+| `playbook.yml`                | 5 plays: common, nginx (webs+lb), db (PostgreSQL), webs (Flask), lb (dnsmasq+LB) |
 | `ansible_hosts`               | static inventory (WSL only): hosts at `127.0.0.1:221x`, keys at `~/.ssh/vagrant-lab/`, plus `private_ip` vars |
 | `ansible.cfg`                 | host key checking off (VMs are rebuilt often)                    |
-| `templates/`                  | `index.html.j2`, `loadbalancer.conf.j2`                           |
+| `group_vars/all.yml`          | shared values: `lab_domain`, PG version, tiket db/user/password |
+| `templates/app.py.j2`         | Flask app: visit counter in the shared PostgreSQL on `db.tiket.lab` |
+| `templates/tiket-app.service.j2` | systemd unit running gunicorn as www-data                     |
+| `templates/web-site.conf.j2`  | per-web nginx site → proxy to local gunicorn                     |
+| `templates/loadbalancer.conf.j2` | lb nginx config, upstreams by DNS name                        |
+| `templates/dnsmasq.conf.j2`   | lab DNS zone + upstream forwarding                               |
 | `sync-keys.sh`                | copies Vagrant keys from `/mnt/c` to WSL fs so chmod 600 works   |
 
-Note: `loadbalancer.conf.j2` builds its upstream from each webserver's
+Note: the LB upstream list uses DNS names built from each host's
 `private_ip` inventory var — **not** `ansible_host`, which is `127.0.0.1`
 here (and also in Vagrant's auto-generated inventory). Using `ansible_host`
 would make lb proxy to itself.
@@ -88,5 +183,23 @@ would make lb proxy to itself.
   whole layout needs the host-only IPs instead.
 - **`UNPROTECTED PRIVATE KEY FILE` for `.vagrant/machines/.../private_key`**
   — same /mnt/c permissions issue; the fix is the same `sync-keys.sh`.
-- **Port 221x/8080 already in use** — something else on Windows grabbed it;
+- **Port 221x/808x already in use** — something else on Windows grabbed it;
   the `auto: false` forwards will error rather than silently move.
+- **gunicorn fails with 203/EXEC** — the executable isn't in
+  `python3-gunicorn` on Debian 12 (libs only); the playbook installs
+  `gunicorn` for the binary.
+- **Webs can't resolve names while lb is halted** — their resolv.conf
+  lists the NAT resolver as fallback, so apt still works, but `*.tiket.lab`
+  names only exist while lb's dnsmasq is running.
+- **App returns 500s** — the web can't reach or authenticate to the
+  database. Check in order: `dig db.tiket.lab` from a web (dnsmasq up?),
+  `systemctl status postgresql` on db, and the `pg_hba` rules in
+  `/etc/postgresql/15/main/pg_hba.conf` (the app's IP must match a `host
+  tiketdb tiket` line).
+- **App 500s "out of nowhere" after hours of uptime** — DHCP lease renewal
+  rewrites the webs' resolv.conf with the NAT resolver, dropping the lab
+  nameservers. The playbook installs a no-op hook at
+  `/etc/dhcp/dhclient-enter-hooks.d/tiket-dns` (`make_resolv_conf() { :; }`)
+  on lb and the webs so resolv.conf stays exactly as Ansible wrote it.
+- **RAM** — four VMs at 1 GB each; lower `vb.memory` in the Vagrantfile if
+  the host is tight (the db VM is the best candidate to shrink).
