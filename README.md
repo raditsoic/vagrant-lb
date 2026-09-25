@@ -5,13 +5,13 @@ Four Debian 12 VMs (VirtualBox, managed by Vagrant, provisioned by Ansible):
 | Machine | Private IP      | Role                                  | NAT forward (127.0.0.1)             |
 | ------- | --------------- | ------------------------------------- | ----------------------------------- |
 | `lb`    | `192.168.56.10` | nginx LB + dnsmasq DNS (`tiket.lab`)  | SSH `2210`, HTTP `8080`, DNS `5533` |
-| `web1`  | `192.168.56.11` | Flask app + gunicorn, nginx           | SSH `2211`, HTTP `8081`             |
-| `web2`  | `192.168.56.12` | Flask app + gunicorn, nginx           | SSH `2212`, HTTP `8082`             |
+| `web1`  | `192.168.56.11` | app container (docker), nginx         | SSH `2211`, HTTP `8081`             |
+| `web2`  | `192.168.56.12` | app container (docker), nginx         | SSH `2212`, HTTP `8082`             |
 | `db`    | `192.168.56.20` | PostgreSQL 15 (shared visits DB)      | SSH `2213`, psql `5433`             |
 
-`lb` proxies port 80 round-robin across the two webs over the private
-host-only network. Each web runs the **same** Flask app (under gunicorn),
-and all webs write to **one shared PostgreSQL** on `db.tiket.lab` — the
+host-only network. Each web runs the **same** app container (pulled from
+the lab's own registry — see "Containerized app + registry" below), and
+all webs write to **one shared PostgreSQL** on `db.tiket.lab` — the
 production topology: interchangeable stateless app VMs plus a dedicated
 database VM. Responses still name the node that handled them, so hitting
 the load balancer visibly alternates between `web1` and `web2`, but the
@@ -28,6 +28,7 @@ names (`web1.tiket.lab:80`, …) for its upstreams instead of IPs.
 ```bash
 vagrant up            # WSL vagrant — NOT vagrant.exe (see below)
 ./sync-keys.sh        # copy VM keys to ~/.ssh/vagrant-lab with Linux permissions
+./registry/up.sh      # start the lab registry (reads the vault; see below)
 vagrant provision     # run the Ansible playbook (needs ~/.vault-tiket-lab — see Secrets)
 ```
 
@@ -89,6 +90,46 @@ edit needed):
 curl --resolve web1.tiket.lab:8081:127.0.0.1 http://web1.tiket.lab:8081/
 ```
 
+## Containerized app + registry
+
+The app ships as a container image built from `app/` (Flask + gunicorn +
+psycopg2; the DSN arrives via env vars, so **the image contains no
+credentials** and is safe to push). A registry container runs on the WSL/
+Windows side, and the webs pull from it. Two modes:
+
+- **Tunnel mode (normal)** — `./registry/up.sh --profile tunnel` with a
+  named Cloudflare tunnel (token in `registry/.env`) publishes the registry
+  at a real TLS hostname. Set `registry_host` in
+  `group_vars/all/vars.yml` to that hostname; `registry_insecure_addresses`
+  stays empty and no daemon exceptions exist.
+- **Offline/NAT mode (no Cloudflare account)** — the guests reach the
+  Windows host's loopback registry through the VirtualBox NAT gateway at
+  `10.0.2.2:5000`. Plain HTTP, so `registry_insecure_addresses` must list
+  it — the playbook writes `/etc/docker/daemon.json` accordingly. This is
+  the current default in `vars.yml`.
+
+Build and publish a version (anywhere docker works):
+
+```bash
+docker build -t localhost:5000/tiket-app:v1 app/
+printf '%s' "$(ansible-vault view group_vars/all/vault.yml --vault-password-file ~/.vault-tiket-lab | sed -n 's/^vault_registry_password: //p')" \
+  | docker login localhost:5000 -u tiket --password-stdin
+docker push localhost:5000/tiket-app:v1
+```
+
+(Pushing as `localhost:5000/…` and pulling as `10.0.2.2:5000/…` hits the
+same registry — the repo path is just `tiket-app`; only the transport
+address differs. For tunnel mode, tag/push with the tunnel hostname.)
+
+Deploy: bump `app_version` in `group_vars/all/vars.yml`, then
+`vagrant provision` — the webs log in, pull the tag, and recreate the
+container. Container DNS forwards through the host's resolv.conf (lb's
+dnsmasq), so `db.tiket.lab` resolves inside the container; container
+egress is SNAT'ed to the web's `192.168.56.x` address, which the db's
+`pg_hba` rule already covers. The image's `HEALTHCHECK` curls the app's
+`/healthz` (200 only while the db is reachable) — `docker ps` shows
+`(healthy)` once it is.
+
 ### Lifecycle — `vagrant up` to `vagrant destroy`
 
 ```bash
@@ -130,7 +171,7 @@ Notes:
 
 ## Secrets
 
-The db password lives vault-encrypted in `group_vars/all/vault.yml` — the
+The db and registry passwords live vault-encrypted in `group_vars/all/vault.yml` — the
 repo contains no plaintext credential. The vault password itself is
 deliberately **not** in the repo: it sits at `~/.vault-tiket-lab` (mode
 0600, on the WSL filesystem). It can't live under `/mnt/c`: files there are
@@ -144,8 +185,9 @@ file as a script to execute rather than a password to read.
 ansible-playbook -i ansible_hosts playbook.yml --vault-password-file ~/.vault-tiket-lab
 ```
 
-Rotate the password (edits the vault file, then one provision updates the
-PostgreSQL role and every web's DSN and restarts the apps):
+Rotate a password (edits the vault file; the next provision updates the
+PostgreSQL role and every web's container DSN — for the registry password,
+`./registry/up.sh` regenerates the htpasswd and a provision re-logs-in):
 
 ```bash
 ansible-vault edit group_vars/all/vault.yml --vault-password-file ~/.vault-tiket-lab
@@ -200,11 +242,12 @@ but harmless.
    rules admitting the app role from `192.168.56.0/24` (the webs) and
    `10.0.2.2/32` (WSL via the NAT forward), plus the `tiket` role and
    `tiketdb` database.
-4. **webservers** — Flask app + gunicorn (`/opt/tiket/app.py`, systemd unit
-   `tiket-app`; the app connects to `db.tiket.lab` over psycopg2), nginx
-   site proxying to `127.0.0.1:8000`, resolv.conf pointed at lb's dnsmasq
-   with the NAT resolver as fallback, plus a dhclient enter-hook that keeps
-   resolv.conf authoritative across DHCP renewals.
+4. **webservers** — docker (`docker.io` + SDK), optional `daemon.json`
+   whitelist for the plain-HTTP registry, registry login, then the app
+   container published on `127.0.0.1:8000` (env-injected DSN, image pulled
+   from `registry_host`), nginx site proxying to it, resolv.conf pointed at
+   lb's dnsmasq with the NAT resolver as fallback, plus a dhclient
+   enter-hook that keeps resolv.conf authoritative across DHCP renewals.
 5. **loadbalancers** — dnsmasq config for `tiket.lab`, resolv.conf at
    `127.0.0.1`, nginx LB config with DNS-named upstreams, same dhclient
    enter-hook.
@@ -230,11 +273,12 @@ Two ordering details that matter:
 | `playbook.yml`                | 5 plays: common, nginx (webs+lb), db (PostgreSQL), webs (Flask), lb (dnsmasq+LB) |
 | `ansible_hosts`               | static inventory (WSL only): hosts at `127.0.0.1:221x`, keys at `~/.ssh/vagrant-lab/`, plus `private_ip` vars |
 | `ansible.cfg`                 | host key checking off (VMs are rebuilt often)                    |
-| `group_vars/all/vars.yml`     | shared plaintext values: `lab_domain`, PG version, tiket db name/user |
-| `group_vars/all/vault.yml`    | ansible-vault-encrypted db password (`vault_tiket_db_password`)        |
-| `templates/app.py.j2`         | Flask app: visit counter in the shared PostgreSQL on `db.tiket.lab` |
-| `templates/tiket-app.service.j2` | systemd unit running gunicorn as www-data                     |
-| `templates/web-site.conf.j2`  | per-web nginx site → proxy to local gunicorn                     |
+| `group_vars/all/vars.yml`     | shared values: `lab_domain`, PG version, db name/user, registry/image vars |
+| `group_vars/all/vault.yml`    | ansible-vault-encrypted db + registry passwords                        |
+| `app/`                        | app image sources: `app.py` (env-configured) + `Dockerfile`            |
+| `registry/compose.yaml`, `registry/up.sh` | lab image registry (+ cloudflared tunnel profile) and its bootstrap |
+| `requirements.yml`            | Ansible collections (`community.docker`, `community.postgresql`)       |
+| `templates/web-site.conf.j2`  | per-web nginx site → proxy to the local app container                  |
 | `templates/loadbalancer.conf.j2` | lb nginx config, upstreams by DNS name                        |
 | `templates/dnsmasq.conf.j2`   | lab DNS zone + upstream forwarding                               |
 | `sync-keys.sh`                | copies Vagrant keys from `/mnt/c` to WSL fs so chmod 600 works   |
@@ -256,9 +300,17 @@ would make lb proxy to itself.
   — same /mnt/c permissions issue; the fix is the same `sync-keys.sh`.
 - **Port 221x/808x already in use** — something else on Windows grabbed it;
   the `auto: false` forwards will error rather than silently move.
-- **gunicorn fails with 203/EXEC** — the executable isn't in
-  `python3-gunicorn` on Debian 12 (libs only); the playbook installs
-  `gunicorn` for the binary.
+- **Container unhealthy / app 502s** — `vagrant ssh web1 -c 'sudo docker ps -a'`:
+  the image `HEALTHCHECK` curls `/healthz`, which answers 503 exactly when
+  the db is unreachable. `sudo docker logs tiket-app` shows the psycopg2
+  error (DNS? pg_hba? password?).
+- **`pull access denied` / 401 from the registry** — the vault's registry
+  password and the registry's htpasswd disagree; re-run `./registry/up.sh`
+  (regenerates the hash) then `vagrant provision`.
+- **`http: server gave HTTP response to HTTPS client`** — pulling the
+  plain-HTTP registry without the daemon whitelist: `registry_insecure_addresses`
+  in `group_vars/all/vars.yml` must list it (offline/NAT mode), or front
+  the registry with the tunnel for real TLS.
 - **Webs can't resolve names while lb is halted** — their resolv.conf
   lists the NAT resolver as fallback, so apt still works, but `*.tiket.lab`
   names only exist while lb's dnsmasq is running.
@@ -277,5 +329,6 @@ would make lb proxy to itself.
   (fresh clone, new machine). Recreate it with the same content, or
   re-encrypt the vault file with a new password (see Secrets). A
   vault-password file under `/mnt/c` will never work — see Secrets for why.
-- **RAM** — four VMs at 1 GB each; lower `vb.memory` in the Vagrantfile if
-  the host is tight (the db VM is the best candidate to shrink).
+- **RAM** — four VMs at 1 GB each, and the webs now also run the docker
+  daemon (~+80 MB); lower `vb.memory` in the Vagrantfile or bump the webs
+  to 1.5 GB if the host is tight (the db VM is the best candidate to shrink).

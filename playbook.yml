@@ -89,50 +89,99 @@
         state: restarted
 
 
-- name: Configure web servers (Flask app + shared PostgreSQL + nginx proxy)
+- name: Configure web servers (containerized Flask app + shared PostgreSQL + nginx proxy)
   hosts: webservers
   become: true
   tasks:
-    - name: Install app packages
+    - name: Fail fast when the registry is not configured
+      ansible.builtin.assert:
+        that: registry_host | length > 0
+        fail_msg: >-
+          set registry_host in group_vars/all/vars.yml — the tunnel hostname
+          after `./registry/up.sh` (see README "Containerized app + registry")
+
+    - name: Install docker and the Python SDK for the Ansible docker modules
+      # python3-docker = Docker SDK for Python, which community.docker's
+      # login/container modules talk through.
       ansible.builtin.apt:
-        # NB: the executable is in "gunicorn"; python3-gunicorn is libs only.
-        name: [python3-flask, gunicorn, python3-psycopg2, dnsutils]
+        name: [docker.io, python3-docker, dnsutils]
         state: present
 
-    - name: Create app directory owned by the web server user
-      ansible.builtin.file:
-        path: /opt/tiket
-        state: directory
-        owner: www-data
-        group: www-data
-        mode: "0755"
-
-    - name: Deploy Flask app
-      ansible.builtin.template:
-        src: templates/app.py.j2
-        dest: /opt/tiket/app.py
-        owner: www-data
-        group: www-data
+    - name: Whitelist the plain-HTTP registry for the docker daemon
+      # Only needed in offline/NAT mode, where the registry has no TLS front.
+      # Pulls through the Cloudflare tunnel are real TLS: the whitelist (and
+      # this file) must then be empty/absent.
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
         mode: "0644"
-      notify: restart tiket-app
+        content: "{{ {'insecure-registries': registry_insecure_addresses} | to_nice_json }}"
+      when: registry_insecure_addresses | length > 0
+      notify: restart docker
 
-    - name: Remove the old per-node SQLite file (state now lives in db.tiket.lab)
+    - name: Drop the daemon whitelist when pulling over TLS
       ansible.builtin.file:
-        path: /opt/tiket/visits.db
+        path: /etc/docker/daemon.json
         state: absent
+      when: registry_insecure_addresses | length == 0
+      notify: restart docker
 
-    - name: Install systemd unit for gunicorn
-      ansible.builtin.template:
-        src: templates/tiket-app.service.j2
-        dest: /etc/systemd/system/tiket-app.service
-        mode: "0644"
-      notify: restart tiket-app
-
-    - name: Enable and start the app
+    - name: Ensure docker is running and enabled at boot
       ansible.builtin.systemd:
-        name: tiket-app
+        name: docker
         state: started
         enabled: true
+
+    - name: Apply the daemon config now, not at end of play
+      # The registry login/pull below needs the whitelist already active —
+      # a handler restart would only fire after them.
+      ansible.builtin.meta: flush_handlers
+
+    - name: Stop the old bare-metal app service (pre-container deployments)
+      # Teardown for VMs provisioned by the earlier gunicorn/systemd play.
+      # The unit is already gone on freshly built machines, which systemd
+      # reports as failure — tolerated here by design.
+      ansible.builtin.systemd:
+        name: tiket-app
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the old bare-metal app files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/tiket-app.service
+        - /opt/tiket
+      notify: daemon-reload
+
+    - name: Log in to the image registry
+      # Auth lives at /root/.docker/config.json; the pull below uses it.
+      community.docker.docker_login:
+        registry: "{{ registry_host }}"
+        username: "{{ registry_user }}"
+        password: "{{ vault_registry_password }}"
+
+    - name: Run the app container
+      # Publishes on 127.0.0.1:8000 — exactly where the local nginx site
+      # (web-site.conf.j2) already proxies, so the nginx config is untouched.
+      # DNS: docker's embedded resolver forwards to the host's resolv.conf
+      # (lb's dnsmasq), so db.tiket.lab resolves inside the container.
+      community.docker.docker_container:
+        name: tiket-app
+        # Container hostname = VM name, so the app's "Hello from web1/web2"
+        # (socket.gethostname) and the visits.host rows stay meaningful —
+        # by default docker would show the container ID.
+        hostname: "{{ inventory_hostname }}"
+        image: "{{ registry_host }}/tiket-app:{{ app_version }}"
+        restart_policy: unless-stopped
+        ports:
+          - "127.0.0.1:8000:8000"
+        env:
+          DB_HOST: db.{{ lab_domain }}
+          DB_NAME: "{{ tiket_db.name }}"
+          DB_USER: "{{ tiket_db.user }}"
+          DB_PASSWORD: "{{ tiket_db.password }}"
 
     - name: Deploy nginx site proxying to the app
       ansible.builtin.template:
@@ -159,7 +208,8 @@
       # resolver NAT hands out, silently dropping the lab nameservers —
       # and then the app 500s, since it resolves db.tiket.lab on every
       # request. This hook no-ops the resolv.conf writer; the copy below
-      # stays authoritative no matter what DHCP says.
+      # stays authoritative no matter what DHCP says. The container's
+      # embedded DNS also forwards here, so this keeps working.
       ansible.builtin.copy:
         dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
         mode: "0644"
@@ -177,17 +227,19 @@
           nameserver 10.0.2.3
 
   handlers:
-    - name: restart tiket-app
+    - name: restart docker
       ansible.builtin.systemd:
-        name: tiket-app
+        name: docker
         state: restarted
+
+    - name: daemon-reload
+      ansible.builtin.systemd:
         daemon_reload: true
 
     - name: restart nginx
       ansible.builtin.service:
         name: nginx
         state: restarted
-
 
 - name: Configure DNS (dnsmasq) and load balancer
   hosts: loadbalancers

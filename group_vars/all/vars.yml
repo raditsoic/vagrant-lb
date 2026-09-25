@@ -14,3 +14,20 @@ tiket_db:
   # decrypted automatically at run time. The vault password file is wired
   # up in the Vagrantfile provisioner block.
   password: "{{ vault_tiket_db_password }}"
+
+# --- Container image registry -------------------------------------------------
+# Where the app image is pulled from. After `./registry/up.sh` + the tunnel
+# are running, set registry_host to the tunnel's public hostname. While
+# testing without the tunnel, guests can reach a registry on the Windows
+# host's loopback via the VirtualBox NAT gateway (10.0.2.2) — that mode is
+# plain HTTP and needs the daemon whitelist below.
+registry_host: "10.0.2.2:5000"
+registry_user: tiket
+
+# Tag to pull; bump to deploy (build/push first — see README).
+app_version: v1
+
+# Plain-HTTP registry addresses the guest docker daemon must whitelist.
+# Empty once pulls go through the Cloudflare tunnel (real TLS).
+registry_insecure_addresses:
+  - 10.0.2.2:5000
