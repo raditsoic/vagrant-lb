@@ -43,16 +43,18 @@ Vagrant.configure("2") do |config|
     db.vm.network "private_network", ip: "192.168.56.20"
     db.vm.hostname = "db"
     db.vm.network "forwarded_port", guest: 22, host: 2213, host_ip: "127.0.0.1", auto: false
-    # psql straight from WSL/Windows through the NAT forward:
-    #   psql "host=127.0.0.1 port=5433 dbname=tiketdb user=tiket password=tiket-lab"
-    db.vm.network "forwarded_port", guest: 5432, host: 5433, host_ip: "127.0.0.1", auto: false
+    # psql straight from WSL/Windows through the NAT forward — the password
+    # is vault-sealed now; see README "Secrets" for how to read it.
   end
 
   config.vm.provision "ansible" do |ansible|
     ansible.playbook = "playbook.yml"
+    # group_vars/all/vault.yml is ansible-vault encrypted; the vault password
+    # lives outside the repo at ~/.vault-tiket-lab (files on /mnt/c are always
+    # "+x", which ansible-vault would execute as a password *script*).
+    ansible.vault_password_file = File.expand_path("~/.vault-tiket-lab")
     if wsl
       # Vagrant's auto-generated inventory points at keys on /mnt/c, which
-      # can't have Linux permissions — use our static inventory instead.
       ansible.inventory_path = "ansible_hosts"
     else
       ansible.groups = {

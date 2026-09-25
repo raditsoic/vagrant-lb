@@ -7,8 +7,10 @@ lab_domain: tiket.lab
 # Debian 12 (bookworm) ships PostgreSQL 15.
 pg_version: 15
 
-# Lab-only credential — fine to keep in a repo; never do this in production.
 tiket_db:
   name: tiketdb
   user: tiket
-  password: tiket-lab
+  # Actual value is vault-encrypted in vault.yml (same directory) and is
+  # decrypted automatically at run time. The vault password file is wired
+  # up in the Vagrantfile provisioner block.
+  password: "{{ vault_tiket_db_password }}"

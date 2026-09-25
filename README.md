@@ -28,7 +28,7 @@ names (`web1.tiket.lab:80`, …) for its upstreams instead of IPs.
 ```bash
 vagrant up            # WSL vagrant — NOT vagrant.exe (see below)
 ./sync-keys.sh        # copy VM keys to ~/.ssh/vagrant-lab with Linux permissions
-vagrant provision     # run the Ansible playbook
+vagrant provision     # run the Ansible playbook (needs ~/.vault-tiket-lab — see Secrets)
 ```
 
 Verify the app through the load balancer:
@@ -56,7 +56,7 @@ vagrant ssh db -c "sudo -u postgres psql tiketdb -c 'SELECT host, COUNT(*) FROM 
 psql straight from WSL (or Windows) through the `5433` NAT forward:
 
 ```bash
-psql "host=127.0.0.1 port=5433 dbname=tiketdb user=tiket password=tiket-lab" -c '\dt'
+psql "host=127.0.0.1 port=5433 dbname=tiketdb user=tiket password=$(ansible-vault view group_vars/all/vault.yml --vault-password-file ~/.vault-tiket-lab | tail -1 | cut -d' ' -f2)" -c '\dt'
 ```
 
 Direct access to the webs (works from WSL and from a Windows browser):
@@ -88,6 +88,74 @@ edit needed):
 ```bash
 curl --resolve web1.tiket.lab:8081:127.0.0.1 http://web1.tiket.lab:8081/
 ```
+
+### Lifecycle — `vagrant up` to `vagrant destroy`
+
+```bash
+# one-time prerequisite: vault password at ~/.vault-tiket-lab (see Secrets).
+# It lives on the WSL filesystem, outside the repo — destroy never touches it.
+
+vagrant up              # create + start the VMs
+./sync-keys.sh          # after every up that (re)created machines: refresh ~/.ssh/vagrant-lab
+vagrant provision       # run/re-run the playbook on running VMs (needs the vault password)
+
+# day to day
+vagrant halt            # shut down, disks kept; plain `vagrant up` boots without re-provisioning
+vagrant suspend         # or freeze VM state; `vagrant resume` (or `vagrant up`) continues
+vagrant destroy -f      # delete VMs + disks — this is what wipes state (the visits table)
+```
+
+Rebuilding from scratch: recreated VMs get new SSH keys, so skip the
+auto-provision on `up` (it would fail auth against the stale synced keys),
+resync, then provision:
+
+```bash
+vagrant destroy -f
+vagrant up --no-provision
+./sync-keys.sh
+vagrant provision
+```
+
+Notes:
+
+- `~/.vault-tiket-lab` is machine-independent: it survives destroy/rebuild,
+  and every provision needs it.
+- Destroy drops the database with the VM. The playbook recreates the role
+  and database, and the app recreates the `visits` table (`CREATE TABLE IF
+  NOT EXISTS`) — the counter starts over at 0.
+- Recreated VMs also have new SSH host keys. Ansible doesn't care (Vagrant
+  runs it with host-key checking off), but plain `ssh -p 2210
+  vagrant@127.0.0.1` may need `ssh-keygen -R '[127.0.0.1]:2210'` first
+  (2210–2213, one per VM).
+
+## Secrets
+
+The db password lives vault-encrypted in `group_vars/all/vault.yml` — the
+repo contains no plaintext credential. The vault password itself is
+deliberately **not** in the repo: it sits at `~/.vault-tiket-lab` (mode
+0600, on the WSL filesystem). It can't live under `/mnt/c`: files there are
+always marked executable, and ansible-vault treats an executable password
+file as a script to execute rather than a password to read.
+
+`vagrant provision` picks the file up via the Vagrantfile provisioner
+(`ansible.vault_password_file`); manual ansible runs must pass it:
+
+```bash
+ansible-playbook -i ansible_hosts playbook.yml --vault-password-file ~/.vault-tiket-lab
+```
+
+Rotate the password (edits the vault file, then one provision updates the
+PostgreSQL role and every web's DSN and restarts the apps):
+
+```bash
+ansible-vault edit group_vars/all/vault.yml --vault-password-file ~/.vault-tiket-lab
+vagrant provision
+```
+
+Honest caveat: the old value remains in this repo's git history — it was
+committed in plaintext (in `group_vars/all.yml`, and printed in this README)
+before vaulting. Vaulting keeps it out of future commits; if that history
+matters, rotate as shown above.
 
 ## WSL + VirtualBox: why it's set up this way
 
@@ -141,8 +209,10 @@ but harmless.
    `127.0.0.1`, nginx LB config with DNS-named upstreams, same dhclient
    enter-hook.
 
-Shared values (db name/user/password, `lab_domain`, PG version) live in
-`group_vars/all.yml` because play-level vars don't cross plays.
+Shared values (`lab_domain`, PG version, db name/user) live in
+`group_vars/all/vars.yml` because play-level vars don't cross plays; the db
+password is vault-encrypted in the same directory (see Secrets) and stitched
+in as `tiket_db.password: "{{ vault_tiket_db_password }}"`.
 
 Two ordering details that matter:
 
@@ -160,7 +230,8 @@ Two ordering details that matter:
 | `playbook.yml`                | 5 plays: common, nginx (webs+lb), db (PostgreSQL), webs (Flask), lb (dnsmasq+LB) |
 | `ansible_hosts`               | static inventory (WSL only): hosts at `127.0.0.1:221x`, keys at `~/.ssh/vagrant-lab/`, plus `private_ip` vars |
 | `ansible.cfg`                 | host key checking off (VMs are rebuilt often)                    |
-| `group_vars/all.yml`          | shared values: `lab_domain`, PG version, tiket db/user/password |
+| `group_vars/all/vars.yml`     | shared plaintext values: `lab_domain`, PG version, tiket db name/user |
+| `group_vars/all/vault.yml`    | ansible-vault-encrypted db password (`vault_tiket_db_password`)        |
 | `templates/app.py.j2`         | Flask app: visit counter in the shared PostgreSQL on `db.tiket.lab` |
 | `templates/tiket-app.service.j2` | systemd unit running gunicorn as www-data                     |
 | `templates/web-site.conf.j2`  | per-web nginx site → proxy to local gunicorn                     |
@@ -201,5 +272,10 @@ would make lb proxy to itself.
   nameservers. The playbook installs a no-op hook at
   `/etc/dhcp/dhclient-enter-hooks.d/tiket-dns` (`make_resolv_conf() { :; }`)
   on lb and the webs so resolv.conf stays exactly as Ansible wrote it.
+- **`Attempting to decrypt but no vault password found` / provision
+  aborts on `group_vars/all/vault.yml`** — `~/.vault-tiket-lab` is missing
+  (fresh clone, new machine). Recreate it with the same content, or
+  re-encrypt the vault file with a new password (see Secrets). A
+  vault-password file under `/mnt/c` will never work — see Secrets for why.
 - **RAM** — four VMs at 1 GB each; lower `vb.memory` in the Vagrantfile if
   the host is tight (the db VM is the best candidate to shrink).
