@@ -155,6 +155,32 @@
         - /opt/tiket
       notify: daemon-reload
 
+    - name: Write the CI deploy env file (registry credentials)
+      # Sourced by deploy.sh (app repo) when Jenkins rolls the container over
+      # SSH. Secrets stay on the VM; Jenkins itself only holds a deploy key.
+      ansible.builtin.copy:
+        content: |
+          REGISTRY={{ registry_host }}
+          REGISTRY_USER={{ registry_user }}
+          REGISTRY_PASSWORD={{ vault_registry_password }}
+        dest: /root/tiket-deploy.env
+        mode: "0600"
+      no_log: true
+
+    - name: Write the app container env file
+      # Single source of truth for the app container's environment: the
+      # docker_container task below AND CI deploys (deploy.sh --env-file)
+      # both consume this file.
+      ansible.builtin.copy:
+        content: |
+          DB_HOST=db.{{ lab_domain }}
+          DB_NAME={{ tiket_db.name }}
+          DB_USER={{ tiket_db.user }}
+          DB_PASSWORD={{ tiket_db.password }}
+        dest: /root/tiket-app.env
+        mode: "0600"
+      no_log: true
+
     - name: Log in to the image registry
       # Auth lives at /root/.docker/config.json; the pull below uses it.
       community.docker.docker_login:
@@ -177,11 +203,7 @@
         restart_policy: unless-stopped
         ports:
           - "127.0.0.1:8000:8000"
-        env:
-          DB_HOST: db.{{ lab_domain }}
-          DB_NAME: "{{ tiket_db.name }}"
-          DB_USER: "{{ tiket_db.user }}"
-          DB_PASSWORD: "{{ tiket_db.password }}"
+        env_file: /root/tiket-app.env
 
     - name: Deploy nginx site proxying to the app
       ansible.builtin.template:

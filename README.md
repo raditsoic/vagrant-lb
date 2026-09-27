@@ -288,6 +288,24 @@ Note: the LB upstream list uses DNS names built from each host's
 here (and also in Vagrant's auto-generated inventory). Using `ansible_host`
 would make lb proxy to itself.
 
+## CI/CD (Jenkins)
+
+- App repo: `github.com/Raditsoic/tiket-app` (moved out of this repo; this
+  repo's playbook still owns the web VMs' container config).
+- Every push: GitHub webhook → Jenkins (`jenkins` container on host 8085,
+  fronted by the `jenkins-tunnel` cloudflared container) builds and pushes
+  `localhost:5000/tiket-app:<branch>-<build>`; on `main` it also pushes
+  `latest` and SSH-deploys web1 then web2 with the app repo's `deploy.sh`
+  (one VM at a time, health-checked through the 8081/8082 forwards).
+- VM secrets live in `/root/tiket-deploy.env` + `/root/tiket-app.env`,
+  written by the playbook from the vault. A VM rebuild needs the web play
+  re-run plus the deploy pubkey `~/.ssh/tiket-deploy-jenkins.pub`
+  re-installed into `authorized_keys`.
+- UI: http://127.0.0.1:8085 (host) / https://jenkins.spacetrek.xyz (tunnel).
+- After the first green `main` build, `app_version` in
+  `group_vars/all/vars.yml` flips `v1` → `latest` so `vagrant provision`
+  and CI agree on the tag.
+
 ## Troubleshooting
 
 - **`Permission denied (publickey)` from Ansible** — a new machine was

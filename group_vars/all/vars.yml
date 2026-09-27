@@ -25,7 +25,10 @@ registry_host: "10.0.2.2:5000"
 registry_user: tiket
 
 # Tag to pull; bump to deploy (build/push first — see README).
-app_version: v1
+# CI pushes a moving `latest` on every main build (Jenkinsfile), so
+# provision and CI deploys agree on the tag. Pin an exact `main-N` tag to
+# roll the lab back to a specific build.
+app_version: latest
 
 # Plain-HTTP registry addresses the guest docker daemon must whitelist.
 # Empty once pulls go through the Cloudflare tunnel (real TLS).
