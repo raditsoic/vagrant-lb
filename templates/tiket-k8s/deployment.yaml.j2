@@ -6,6 +6,14 @@ metadata:
     app: tiket-app
 spec:
   replicas: 2
+  # Rollouts must kill before they schedule: with the hard one-pod-per-node
+  # spread below, a RollingUpdate surge pod (default maxSurge 25% -> 1 on two
+  # replicas) can never be placed on a 2-worker cluster and stalls forever.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: tiket-app
