@@ -1,7 +1,8 @@
 # tiket lab DNS — serves {{ lab_domain }} locally on the host-only network,
 # forwards everything else to VirtualBox NAT's built-in resolver.
-# no-resolv is essential: lb's own /etc/resolv.conf points at 127.0.0.1
-# (i.e. at dnsmasq itself), so dnsmasq must not read it for upstreams.
+# no-resolv is essential: lb's own /etc/resolv.conf points at dnsmasq (via
+# the host-only IP — the address k3s bakes into CoreDNS's upstream), so
+# dnsmasq must not read it for upstreams.
 no-resolv
 server=10.0.2.3
 # 10.0.2.15 is the guest's NAT interface — VirtualBox's 5353 → 53 port

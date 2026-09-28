@@ -1,0 +1,19 @@
+# Catch-all: no host rule, because the lab is hit via Host: 127.0.0.1
+# (host 8080 forward) as well as via node IPs. Traefik (k3s bundled) routes
+# lb:80 and every node's :80 to this.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tiket-app
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tiket-app
+                port:
+                  number: 8000

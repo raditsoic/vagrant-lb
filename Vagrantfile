@@ -17,6 +17,10 @@ Vagrant.configure("2") do |config|
   config.vm.define "lb" do |lb|
     lb.vm.network "private_network", ip: "192.168.56.10"
     lb.vm.hostname = "lb"
+    lb.vm.provider "virtualbox" do |vb|
+      # k3s server + Traefik + CoreDNS need more than the 1 GB default.
+      vb.memory = 2048
+    end
     lb.vm.network "forwarded_port", guest: 22, host: 2210, host_ip: "127.0.0.1", auto: false
     lb.vm.network "forwarded_port", guest: 80, host: 8080, host_ip: "127.0.0.1", auto: false
     # dnsmasq — queryable from WSL with: dig @127.0.0.1 -p 5533 web1.tiket.lab

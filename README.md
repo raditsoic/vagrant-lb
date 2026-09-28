@@ -1,27 +1,32 @@
-# vagrant — nginx load balancer lab
+# vagrant — k3s load balancer lab
 
 Four Debian 12 VMs (VirtualBox, managed by Vagrant, provisioned by Ansible):
 
 | Machine | Private IP      | Role                                  | NAT forward (127.0.0.1)             |
 | ------- | --------------- | ------------------------------------- | ----------------------------------- |
-| `lb`    | `192.168.56.10` | nginx LB + dnsmasq DNS (`tiket.lab`)  | SSH `2210`, HTTP `8080`, DNS `5533` |
-| `web1`  | `192.168.56.11` | app container (docker), nginx         | SSH `2211`, HTTP `8081`             |
-| `web2`  | `192.168.56.12` | app container (docker), nginx         | SSH `2212`, HTTP `8082`             |
+| `lb`    | `192.168.56.10` | k3s server (control plane) + Traefik + dnsmasq | SSH `2210`, HTTP `8080`, DNS `5533` |
+| `web1`  | `192.168.56.11` | k3s agent (worker), runs app pods  | SSH `2211`, HTTP `8081`             |
+| `web2`  | `192.168.56.12` | k3s agent (worker), runs app pods  | SSH `2212`, HTTP `8082`             |
 | `db`    | `192.168.56.20` | PostgreSQL 15 (shared visits DB)      | SSH `2213`, psql `5433`             |
 
-host-only network. Each web runs the **same** app container (pulled from
-the lab's own registry — see "Containerized app + registry" below), and
-all webs write to **one shared PostgreSQL** on `db.tiket.lab` — the
-production topology: interchangeable stateless app VMs plus a dedicated
-database VM. Responses still name the node that handled them, so hitting
-the load balancer visibly alternates between `web1` and `web2`, but the
-visit total now climbs monotonically no matter which node answers — the
-shared DB is exactly what makes the backends swappable.
+All machines share one host-only network. The app runs as a **Kubernetes
+Deployment** (2 replicas, one pod per worker node, image pulled from the
+lab's own registry — see "Containerized app + registry" below), and all
+pods write to **one shared PostgreSQL** on `db.tiket.lab` — the production
+topology: interchangeable stateless pods plus a dedicated database VM.
+Pods receive their node name via the downward API, so responses still name
+the node that handled them: hitting the entry point visibly alternates
+between `web1` and `web2`, while the visit total climbs monotonically no
+matter which pod answers — the shared DB is exactly what makes the
+backends swappable.
 
-`lb` also runs **dnsmasq**, which serves the `tiket.lab` zone for all
-machines in the lab and forwards everything else to VirtualBox NAT's
-resolver. The webs resolve through it, and lb's nginx config uses DNS
-names (`web1.tiket.lab:80`, …) for its upstreams instead of IPs.
+`lb` runs the **k3s server** (tainted `CriticalAddonsOnly`, so app pods
+stay on the workers) and k3s's bundled **Traefik**, which owns port 80:
+the host `8080` forward is the main entry point (ingress → service → both
+pods), and every node also serves Traefik on :80 — that is what the
+`8081`/`8082` forwards hit. lb also still runs **dnsmasq**, which serves
+the `tiket.lab` zone for all machines: pod DNS (CoreDNS → dnsmasq) and the
+nodes' resolv.conf both resolve through it.
 
 ## Run it
 
@@ -92,26 +97,27 @@ curl --resolve web1.tiket.lab:8081:127.0.0.1 http://web1.tiket.lab:8081/
 
 ## Containerized app + registry
 
-The app ships as a container image built from `app/` (Flask + gunicorn +
-psycopg2; the DSN arrives via env vars, so **the image contains no
-credentials** and is safe to push). A registry container runs on the WSL/
-Windows side, and the webs pull from it. Two modes:
+The app ships as a container image built from the app repo
+`github.com/Raditsoic/tiket-app` (Flask + gunicorn + psycopg2; the DSN
+arrives via env vars, so **the image contains no credentials** and is
+safe to push). A registry container runs on the WSL/Windows side, and
+the cluster pulls from it. Two modes:
 
 - **Tunnel mode (normal)** — `./registry/up.sh --profile tunnel` with a
   named Cloudflare tunnel (token in `registry/.env`) publishes the registry
   at a real TLS hostname. Set `registry_host` in
   `group_vars/all/vars.yml` to that hostname; `registry_insecure_addresses`
-  stays empty and no daemon exceptions exist.
+  stays empty and no containerd exceptions exist.
 - **Offline/NAT mode (no Cloudflare account)** — the guests reach the
   Windows host's loopback registry through the VirtualBox NAT gateway at
   `10.0.2.2:5000`. Plain HTTP, so `registry_insecure_addresses` must list
-  it — the playbook writes `/etc/docker/daemon.json` accordingly. This is
-  the current default in `vars.yml`.
+  it — the playbook writes `/etc/rancher/k3s/registries.yaml` (a
+  containerd mirror + auth entry) on every node accordingly. This is the
+  current default in `vars.yml`.
 
 Build and publish a version (anywhere docker works):
-
 ```bash
-docker build -t localhost:5000/tiket-app:v1 app/
+docker build -t localhost:5000/tiket-app:v1 /path/to/tiket-app/
 printf '%s' "$(ansible-vault view group_vars/all/vault.yml --vault-password-file ~/.vault-tiket-lab | sed -n 's/^vault_registry_password: //p')" \
   | docker login localhost:5000 -u tiket --password-stdin
 docker push localhost:5000/tiket-app:v1
@@ -122,13 +128,14 @@ same registry — the repo path is just `tiket-app`; only the transport
 address differs. For tunnel mode, tag/push with the tunnel hostname.)
 
 Deploy: bump `app_version` in `group_vars/all/vars.yml`, then
-`vagrant provision` — the webs log in, pull the tag, and recreate the
-container. Container DNS forwards through the host's resolv.conf (lb's
-dnsmasq), so `db.tiket.lab` resolves inside the container; container
-egress is SNAT'ed to the web's `192.168.56.x` address, which the db's
-`pg_hba` rule already covers. The image's `HEALTHCHECK` curls the app's
-`/healthz` (200 only while the db is reachable) — `docker ps` shows
-`(healthy)` once it is.
+`vagrant provision` — the control plane re-applies the manifests and
+containerd pulls the tag (`imagePullPolicy: Always`, so a re-pushed
+`latest` lands on the next rollout). Pod DNS goes through CoreDNS → lb's
+dnsmasq, so `db.tiket.lab` resolves inside pods; pod egress is SNAT'ed to
+the node's `192.168.56.x` address, which the db's `pg_hba` rule already
+covers. There are no liveness/readiness probes on purpose — the app's `/`
+writes a `visits` row per request, so probes would fabricate rows;
+rollout health is `kubectl rollout status` (what CI uses).
 
 ### Lifecycle — `vagrant up` to `vagrant destroy`
 
@@ -232,25 +239,25 @@ but harmless.
 
 ## How provisioning is structured
 
-`playbook.yml` has five plays:
+`playbook.yml` has four plays:
 
 1. **All machines** — apt cache.
-2. **webservers:loadbalancers** — nginx installed/started/enabled. Not on
-   dbservers: db runs no web server (the db play removes the one an older
-   all-hosts play left behind).
-3. **dbservers** — PostgreSQL 15 listening on all interfaces, `pg_hba`
-   rules admitting the app role from `192.168.56.0/24` (the webs) and
-   `10.0.2.2/32` (WSL via the NAT forward), plus the `tiket` role and
-   `tiketdb` database.
-4. **webservers** — docker (`docker.io` + SDK), optional `daemon.json`
-   whitelist for the plain-HTTP registry, registry login, then the app
-   container published on `127.0.0.1:8000` (env-injected DSN, image pulled
-   from `registry_host`), nginx site proxying to it, resolv.conf pointed at
-   lb's dnsmasq with the NAT resolver as fallback, plus a dhclient
-   enter-hook that keeps resolv.conf authoritative across DHCP renewals.
-5. **loadbalancers** — dnsmasq config for `tiket.lab`, resolv.conf at
-   `127.0.0.1`, nginx LB config with DNS-named upstreams, same dhclient
-   enter-hook.
+2. **dbservers** — PostgreSQL 15 listening on all interfaces, `pg_hba`
+   rules admitting the app role from `192.168.56.0/24` (pod traffic to db
+   arrives SNAT'd to node IPs) and `10.0.2.2/32` (WSL via the NAT
+   forward), plus the `tiket` role and `tiketdb` database.
+3. **loadbalancers (control plane)** — dnsmasq config, resolv.conf at the
+   host-only IP (**not** 127.0.0.1: k3s bakes this file into CoreDNS's
+   upstream, and CoreDNS may run on any node — the host-only address is
+   reachable cluster-wide), nginx removed, containerd registry config,
+   k3s server install (`--node-ip`/`--flannel-iface` pinned to the
+   host-only interface, `CriticalAddonsOnly` taint, kubeconfig mode 644
+   for the CI deploy user), then the app Secret/Deployment/Service/Ingress
+   applied via `k3s kubectl`. Exports the agent join token to the next
+   play.
+4. **webservers (workers)** — docker/nginx teardown, resolv.conf at lb's
+   dnsmasq with the NAT resolver as fallback, same dhclient enter-hook,
+   same registry config and interface pinning, then the k3s agent join.
 
 Shared values (`lab_domain`, PG version, db name/user) live in
 `group_vars/all/vars.yml` because play-level vars don't cross plays; the db
@@ -259,10 +266,10 @@ in as `tiket_db.password: "{{ vault_tiket_db_password }}"`.
 
 Two ordering details that matter:
 
-- On lb, handlers run **dnsmasq before nginx** — nginx resolves upstream
-  names once at start/reload, so dnsmasq must already be answering.
+- The **control-plane play runs before the workers**: the agent install
+  consumes the join token read off lb.
 - lb's dnsmasq config uses `no-resolv` + `server=10.0.2.3`, because lb's
-  own resolv.conf points at `127.0.0.1` (dnsmasq itself) — without
+  own resolv.conf points at dnsmasq (via the host-only IP) — without
   `no-resolv` it would loop trying to read its own forwarder config.
 
 ## Files
@@ -270,41 +277,44 @@ Two ordering details that matter:
 | File                          | Purpose                                                        |
 | ----------------------------- | -------------------------------------------------------------- |
 | `Vagrantfile`                 | VM definitions, port forwards, WSL-aware provisioning           |
-| `playbook.yml`                | 5 plays: common, nginx (webs+lb), db (PostgreSQL), webs (Flask), lb (dnsmasq+LB) |
+| `playbook.yml`                | 4 plays: common, db (PostgreSQL), control plane (k3s server + dnsmasq + manifests), workers (k3s agents) |
 | `ansible_hosts`               | static inventory (WSL only): hosts at `127.0.0.1:221x`, keys at `~/.ssh/vagrant-lab/`, plus `private_ip` vars |
 | `ansible.cfg`                 | host key checking off (VMs are rebuilt often)                    |
 | `group_vars/all/vars.yml`     | shared values: `lab_domain`, PG version, db name/user, registry/image vars |
 | `group_vars/all/vault.yml`    | ansible-vault-encrypted db + registry passwords                        |
-| `app/`                        | app image sources: `app.py` (env-configured) + `Dockerfile`            |
+| `templates/registries.yaml.j2` | containerd registry config (mirror + auth) written to every node |
 | `registry/compose.yaml`, `registry/up.sh` | lab image registry (+ cloudflared tunnel profile) and its bootstrap |
-| `requirements.yml`            | Ansible collections (`community.docker`, `community.postgresql`)       |
-| `templates/web-site.conf.j2`  | per-web nginx site → proxy to the local app container                  |
-| `templates/loadbalancer.conf.j2` | lb nginx config, upstreams by DNS name                        |
+| `requirements.yml`            | Ansible collections (`community.postgresql`)                            |
+| `templates/tiket-k8s/*.yaml.j2` | app workload manifests (Secret, Deployment, Service, Ingress) applied on lb |
 | `templates/dnsmasq.conf.j2`   | lab DNS zone + upstream forwarding                               |
 | `sync-keys.sh`                | copies Vagrant keys from `/mnt/c` to WSL fs so chmod 600 works   |
 
-Note: the LB upstream list uses DNS names built from each host's
-`private_ip` inventory var — **not** `ansible_host`, which is `127.0.0.1`
-here (and also in Vagrant's auto-generated inventory). Using `ansible_host`
-would make lb proxy to itself.
+Note: every cross-node reference (agent→server join URL, CoreDNS's DNS
+upstream, resolv.conf entries) is built from each host's `private_ip`
+inventory var — **not** `ansible_host`, which is `127.0.0.1` here (and
+also in Vagrant's auto-generated inventory) and only means something
+through the WSL NAT forwards.
 
 ## CI/CD (Jenkins)
 
 - App repo: `github.com/Raditsoic/tiket-app` (moved out of this repo; this
-  repo's playbook still owns the web VMs' container config).
+  repo's playbook owns the cluster and the workload manifests).
 - Every push: GitHub webhook → Jenkins (`jenkins` container on host 8085,
   fronted by the `jenkins-tunnel` cloudflared container) builds and pushes
   `localhost:5000/tiket-app:<branch>-<build>`; on `main` it also pushes
-  `latest` and SSH-deploys web1 then web2 with the app repo's `deploy.sh`
-  (one VM at a time, health-checked through the 8081/8082 forwards).
-- VM secrets live in `/root/tiket-deploy.env` + `/root/tiket-app.env`,
-  written by the playbook from the vault. A VM rebuild needs the web play
-  re-run plus the deploy pubkey `~/.ssh/tiket-deploy-jenkins.pub`
-  re-installed into `authorized_keys`.
+  `latest` and rolls the cluster onto the exact `main-N` tag over SSH:
+  `kubectl set image deployment/tiket-app …` + `kubectl rollout status` on
+  lb (port 2210), then a health curl through the 8080 forward. Rollback =
+  `set image` back to an older `main-N`.
+- Registry auth for pulls lives in every node's
+  `/etc/rancher/k3s/registries.yaml` (written by the playbook from the
+  vault). The deploy SSH key goes into **lb's** root `authorized_keys`;
+  plain `kubectl` works for it because the server is installed with
+  `--write-kubeconfig-mode 644`. A lb rebuild needs the plays re-run plus
+  the deploy pubkey `~/.ssh/tiket-deploy-jenkins.pub` re-installed.
 - UI: http://127.0.0.1:8085 (host) / https://jenkins.spacetrek.xyz (tunnel).
-- After the first green `main` build, `app_version` in
-  `group_vars/all/vars.yml` flips `v1` → `latest` so `vagrant provision`
-  and CI agree on the tag.
+- `app_version` in `group_vars/all/vars.yml` stays `latest` for
+  provision-time deploys; CI deploys pin exact `main-N` tags.
 
 ## Troubleshooting
 
@@ -318,21 +328,21 @@ would make lb proxy to itself.
   — same /mnt/c permissions issue; the fix is the same `sync-keys.sh`.
 - **Port 221x/808x already in use** — something else on Windows grabbed it;
   the `auto: false` forwards will error rather than silently move.
-- **Container unhealthy / app 502s** — `vagrant ssh web1 -c 'sudo docker ps -a'`:
-  the image `HEALTHCHECK` curls `/healthz`, which answers 503 exactly when
-  the db is unreachable. `sudo docker logs tiket-app` shows the psycopg2
-  error (DNS? pg_hba? password?).
+- **Pod not serving / app 502s** — `vagrant ssh lb -c 'sudo k3s kubectl
+  get pods -o wide'`, then `sudo k3s kubectl logs deploy/tiket-app`: the
+  logs show the psycopg2 error (DNS? pg_hba? password?). `kubectl
+  describe pod` shows scheduling/pull problems.
 - **`pull access denied` / 401 from the registry** — the vault's registry
   password and the registry's htpasswd disagree; re-run `./registry/up.sh`
   (regenerates the hash) then `vagrant provision`.
 - **`http: server gave HTTP response to HTTPS client`** — pulling the
-  plain-HTTP registry without the daemon whitelist: `registry_insecure_addresses`
+  plain-HTTP registry without the containerd mirror: `registry_insecure_addresses`
   in `group_vars/all/vars.yml` must list it (offline/NAT mode), or front
   the registry with the tunnel for real TLS.
 - **Webs can't resolve names while lb is halted** — their resolv.conf
   lists the NAT resolver as fallback, so apt still works, but `*.tiket.lab`
   names only exist while lb's dnsmasq is running.
-- **App returns 500s** — the web can't reach or authenticate to the
+- **App returns 500s** — a pod can't reach or authenticate to the
   database. Check in order: `dig db.tiket.lab` from a web (dnsmasq up?),
   `systemctl status postgresql` on db, and the `pg_hba` rules in
   `/etc/postgresql/15/main/pg_hba.conf` (the app's IP must match a `host
@@ -347,6 +357,6 @@ would make lb proxy to itself.
   (fresh clone, new machine). Recreate it with the same content, or
   re-encrypt the vault file with a new password (see Secrets). A
   vault-password file under `/mnt/c` will never work — see Secrets for why.
-- **RAM** — four VMs at 1 GB each, and the webs now also run the docker
-  daemon (~+80 MB); lower `vb.memory` in the Vagrantfile or bump the webs
-  to 1.5 GB if the host is tight (the db VM is the best candidate to shrink).
+- **RAM** — lb runs at 2 GB (k3s server + Traefik + CoreDNS), the webs at
+  1 GB each; lower `vb.memory` in the Vagrantfile or shrink lb to 1.5 GB
+  if the host is tight (the db VM is the other candidate).

@@ -8,24 +8,6 @@
         update_cache: true
         cache_valid_time: 3600
 
-- name: nginx on the machines that serve HTTP
-  # Not on dbservers — db runs no web server (an older version of this
-  # playbook installed it on all hosts; the db play below removes it).
-  hosts: webservers:loadbalancers
-  become: true
-  tasks:
-    - name: Install nginx
-      ansible.builtin.apt:
-        name: nginx
-        state: present
-
-    - name: Ensure nginx is running and enabled at boot
-      ansible.builtin.service:
-        name: nginx
-        state: started
-        enabled: true
-
-
 - name: Configure the shared PostgreSQL database
   hosts: dbservers
   become: true
@@ -37,11 +19,6 @@
         name: [postgresql, python3-psycopg2, acl]
         state: present
 
-    - name: Remove nginx (older all-hosts play installed it; db serves no HTTP)
-      ansible.builtin.apt:
-        name: nginx
-        state: absent
-
     - name: Listen on all interfaces (Debian defaults to localhost-only)
       ansible.builtin.lineinfile:
         path: /etc/postgresql/{{ pg_version }}/main/postgresql.conf
@@ -49,13 +26,14 @@
         line: "listen_addresses = '*'"
       notify: restart postgresql
 
-    - name: Allow the app role in from the webs and from WSL
+    - name: Allow the app role in from the cluster nodes and from WSL
       # File-level edit on purpose: postgresql_pg_hba validates against a
       # live server, but the rules must be in place before postgres accepts
       # any remote login at all. One rule per call (users/databases are
       # strings, not lists — a list gets written to the file literally),
       # hence the loop. 10.0.2.2 is how WSL appears to the guest through
-      # VirtualBox's NAT port forward (the 5433 → 5432 one).
+      # VirtualBox's NAT port forward. Pod traffic to db leaves the cluster
+      # SNAT'd to the node's host-only IP, so the /24 covers pods too.
       community.postgresql.postgresql_pg_hba:
         dest: /etc/postgresql/{{ pg_version }}/main/pg_hba.conf
         contype: host
@@ -64,7 +42,7 @@
         address: "{{ item }}"
         method: scram-sha-256
       loop:
-        - 192.168.56.0/24   # the webs, over the host-only network
+        - 192.168.56.0/24   # cluster nodes / SNAT'd pods, host-only network
         - 10.0.2.2/32       # WSL, arriving via the NAT forward
       notify: restart postgresql
 
@@ -88,150 +66,176 @@
         name: postgresql
         state: restarted
 
+- name: Control plane (k3s server, dnsmasq, Traefik entry point)
+  hosts: loadbalancers
+  become: true
+  tasks:
+    - name: Install dnsmasq, dig and curl
+      ansible.builtin.apt:
+        name: [dnsmasq, dnsutils, curl]
+        state: present
 
-- name: Configure web servers (containerized Flask app + shared PostgreSQL + nginx proxy)
+    - name: Deploy dnsmasq config for the lab domain
+      ansible.builtin.template:
+        src: templates/dnsmasq.conf.j2
+        dest: /etc/dnsmasq.d/tiket.conf
+        mode: "0644"
+      notify: restart dnsmasq
+
+    - name: Stop dhclient from rewriting resolv.conf on lease renewal
+      # dhclient rewrites /etc/resolv.conf at every renewal with whatever
+      # resolver NAT hands out, silently dropping the lab nameserver. This
+      # hook no-ops the resolv.conf writer; the copy below stays
+      # authoritative no matter what DHCP says.
+      ansible.builtin.copy:
+        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
+        mode: "0644"
+        content: |
+          #!/bin/sh
+          # Lab DNS is static; never let dhclient-script touch resolv.conf.
+          make_resolv_conf() { :; }
+
+    - name: Point lb's resolver at dnsmasq over the host-only IP
+      # 192.168.56.10, NOT 127.0.0.1: k3s bakes the server node's resolv.conf
+      # into CoreDNS's upstream config, and CoreDNS may run on any node.
+      # 127.0.0.1 would only resolve on lb itself; the host-only address is
+      # reachable cluster-wide and dnsmasq binds it. Single entry on purpose:
+      # extra fallbacks would end up as CoreDNS upstreams that can't answer
+      # .tiket.lab names, making pod DNS flaky.
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver {{ hostvars['lb']['private_ip'] }}
+
+    - name: Create the k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0700"
+
+    - name: Write the containerd registry config
+      # k3s reads this at startup; later changes need the restart handler.
+      ansible.builtin.template:
+        src: templates/registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0600"
+      no_log: true
+      notify: restart k3s
+
+    - name: Find the host-only interface (carries the private IP)
+      # Never hardcode: generic/debian12 may name it eth1 or enp0s8.
+      ansible.builtin.shell: ip -o -4 addr show to {{ private_ip }} | awk '{print $2}'
+      register: k3s_iface_raw
+      changed_when: false
+
+    - name: Record the k3s interface
+      ansible.builtin.set_fact:
+        k3s_iface: "{{ k3s_iface_raw.stdout | trim }}"
+
+    - name: Fail when the host-only interface was not found
+      # flannel would otherwise ride the NAT interface (10.0.2.15 — the same
+      # address string on every VM, unroutable guest-to-guest).
+      ansible.builtin.assert:
+        that: k3s_iface | length > 0
+        fail_msg: no interface owns {{ private_ip }} — cannot pick flannel-iface
+
+    - name: Install k3s server
+      # The installer is rerun-safe and self-healing (regenerates the unit);
+      # it brings k3s, containerd, flannel, Traefik and CoreDNS.
+      # --node-taint keeps app pods off the control plane (k3s's packaged
+      # addons tolerate CriticalAddonsOnly); --write-kubeconfig-mode 644
+      # lets the CI deploy user run plain kubectl — lab-only convenience.
+      # The agent join token lives at /var/lib/rancher/k3s/server/node-token
+      # and is read by the agent play (delegated to lb) — not here, because
+      # `vagrant provision` runs each machine in its own playbook invocation.
+      ansible.builtin.shell: >-
+        curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=stable sh -s - server
+        --node-ip {{ private_ip }}
+        --flannel-iface {{ k3s_iface }}
+        --node-taint CriticalAddonsOnly=true:NoExecute
+        --write-kubeconfig-mode 644
+
+    - name: Wait until the control-plane node is Ready
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node/lb --timeout=180s
+      changed_when: false
+
+    - name: Create the workload manifest directory
+      ansible.builtin.file:
+        path: /opt/tiket-k8s
+        state: directory
+        mode: "0755"
+
+    - name: Deploy the app Secret (single source of the container env)
+      ansible.builtin.template:
+        src: templates/tiket-k8s/secret.yaml.j2
+        dest: /opt/tiket-k8s/secret.yaml
+        mode: "0600"
+      no_log: true
+
+    - name: Deploy the app workload manifests
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/opt/tiket-k8s/{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: templates/tiket-k8s/deployment.yaml.j2, dest: deployment.yaml }
+        - { src: templates/tiket-k8s/service.yaml.j2, dest: service.yaml }
+        - { src: templates/tiket-k8s/ingress.yaml.j2, dest: ingress.yaml }
+
+    - name: Apply the app manifests
+      # Idempotent server-side; second runs diff to "unchanged".
+      ansible.builtin.command: k3s kubectl apply -f /opt/tiket-k8s/
+      changed_when: "'configured' in tiket_apply.stdout or 'created' in tiket_apply.stdout"
+      register: tiket_apply
+
+  handlers:
+    - name: restart dnsmasq
+      ansible.builtin.service:
+        name: dnsmasq
+        state: restarted
+
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+
+- name: Worker nodes (k3s agents)
   hosts: webservers
   become: true
   tasks:
-    - name: Fail fast when the registry is not configured
-      ansible.builtin.assert:
-        that: registry_host | length > 0
-        fail_msg: >-
-          set registry_host in group_vars/all/vars.yml — the tunnel hostname
-          after `./registry/up.sh` (see README "Containerized app + registry")
-
-    - name: Install docker and the Python SDK for the Ansible docker modules
-      # python3-docker = Docker SDK for Python, which community.docker's
-      # login/container modules talk through.
+    - name: Install curl and dig
       ansible.builtin.apt:
-        name: [docker.io, python3-docker, dnsutils]
+        name: [curl, dnsutils]
         state: present
 
-    - name: Whitelist the plain-HTTP registry for the docker daemon
-      # Only needed in offline/NAT mode, where the registry has no TLS front.
-      # Pulls through the Cloudflare tunnel are real TLS: the whitelist (and
-      # this file) must then be empty/absent.
-      ansible.builtin.copy:
-        dest: /etc/docker/daemon.json
-        mode: "0644"
-        content: "{{ {'insecure-registries': registry_insecure_addresses} | to_nice_json }}"
-      when: registry_insecure_addresses | length > 0
-      notify: restart docker
-
-    - name: Drop the daemon whitelist when pulling over TLS
-      ansible.builtin.file:
-        path: /etc/docker/daemon.json
-        state: absent
-      when: registry_insecure_addresses | length == 0
-      notify: restart docker
-
-    - name: Ensure docker is running and enabled at boot
+    - name: Stop the docker daemon (k3s containerd replaces it)
+      # Teardown for VMs provisioned by the earlier docker-based play. On
+      # freshly built machines systemd reports the unit as missing —
+      # tolerated here by design.
       ansible.builtin.systemd:
         name: docker
-        state: started
-        enabled: true
-
-    - name: Apply the daemon config now, not at end of play
-      # The registry login/pull below needs the whitelist already active —
-      # a handler restart would only fire after them.
-      ansible.builtin.meta: flush_handlers
-
-    - name: Stop the old bare-metal app service (pre-container deployments)
-      # Teardown for VMs provisioned by the earlier gunicorn/systemd play.
-      # The unit is already gone on freshly built machines, which systemd
-      # reports as failure — tolerated here by design.
-      ansible.builtin.systemd:
-        name: tiket-app
         state: stopped
         enabled: false
       failed_when: false
 
-    - name: Remove the old bare-metal app files
+    - name: Remove docker and its Python SDK
+      ansible.builtin.apt:
+        name: [docker.io, python3-docker]
+        state: absent
+
+    - name: Remove the old container-era config files
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - /etc/systemd/system/tiket-app.service
-        - /opt/tiket
-      notify: daemon-reload
-
-    - name: Write the CI deploy env file (registry credentials)
-      # Sourced by deploy.sh (app repo) when Jenkins rolls the container over
-      # SSH. Secrets stay on the VM; Jenkins itself only holds a deploy key.
-      ansible.builtin.copy:
-        content: |
-          REGISTRY={{ registry_host }}
-          REGISTRY_USER={{ registry_user }}
-          REGISTRY_PASSWORD={{ vault_registry_password }}
-        dest: /root/tiket-deploy.env
-        mode: "0600"
-      no_log: true
-
-    - name: Write the app container env file
-      # Single source of truth for the app container's environment: the
-      # docker_container task below AND CI deploys (deploy.sh --env-file)
-      # both consume this file.
-      ansible.builtin.copy:
-        content: |
-          DB_HOST=db.{{ lab_domain }}
-          DB_NAME={{ tiket_db.name }}
-          DB_USER={{ tiket_db.user }}
-          DB_PASSWORD={{ tiket_db.password }}
-        dest: /root/tiket-app.env
-        mode: "0600"
-      no_log: true
-
-    - name: Log in to the image registry
-      # Auth lives at /root/.docker/config.json; the pull below uses it.
-      community.docker.docker_login:
-        registry: "{{ registry_host }}"
-        username: "{{ registry_user }}"
-        password: "{{ vault_registry_password }}"
-
-    - name: Run the app container
-      # Publishes on 127.0.0.1:8000 — exactly where the local nginx site
-      # (web-site.conf.j2) already proxies, so the nginx config is untouched.
-      # DNS: docker's embedded resolver forwards to the host's resolv.conf
-      # (lb's dnsmasq), so db.tiket.lab resolves inside the container.
-      community.docker.docker_container:
-        name: tiket-app
-        # Container hostname = VM name, so the app's "Hello from web1/web2"
-        # (socket.gethostname) and the visits.host rows stay meaningful —
-        # by default docker would show the container ID.
-        hostname: "{{ inventory_hostname }}"
-        image: "{{ registry_host }}/tiket-app:{{ app_version }}"
-        restart_policy: unless-stopped
-        ports:
-          - "127.0.0.1:8000:8000"
-        env_file: /root/tiket-app.env
-
-    - name: Deploy nginx site proxying to the app
-      ansible.builtin.template:
-        src: templates/web-site.conf.j2
-        dest: /etc/nginx/sites-available/tiket
-        mode: "0644"
-      notify: restart nginx
-
-    - name: Enable tiket site
-      ansible.builtin.file:
-        src: /etc/nginx/sites-available/tiket
-        dest: /etc/nginx/sites-enabled/tiket
-        state: link
-      notify: restart nginx
-
-    - name: Remove default site (it would shadow our config on port 80)
-      ansible.builtin.file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-      notify: restart nginx
+        - /etc/docker/daemon.json
+        - /root/tiket-deploy.env
+        - /root/tiket-app.env
 
     - name: Stop dhclient from rewriting resolv.conf on lease renewal
-      # dhclient rewrites /etc/resolv.conf at every renewal with whatever
-      # resolver NAT hands out, silently dropping the lab nameservers —
-      # and then the app 500s, since it resolves db.tiket.lab on every
-      # request. This hook no-ops the resolv.conf writer; the copy below
-      # stays authoritative no matter what DHCP says. The container's
-      # embedded DNS also forwards here, so this keeps working.
+      # Same reason as on lb: the copy below must stay authoritative no
+      # matter what DHCP says. The app's pod DNS rides CoreDNS → lb's
+      # dnsmasq, but the node itself still resolves via these entries.
       ansible.builtin.copy:
         dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
         mode: "0644"
@@ -248,76 +252,61 @@
           nameserver {{ hostvars['lb']['private_ip'] }}
           nameserver 10.0.2.3
 
-  handlers:
-    - name: restart docker
-      ansible.builtin.systemd:
-        name: docker
-        state: restarted
-
-    - name: daemon-reload
-      ansible.builtin.systemd:
-        daemon_reload: true
-
-    - name: restart nginx
-      ansible.builtin.service:
-        name: nginx
-        state: restarted
-
-- name: Configure DNS (dnsmasq) and load balancer
-  hosts: loadbalancers
-  become: true
-  tasks:
-    - name: Install dnsmasq (and dig for verification)
-      ansible.builtin.apt:
-        name: [dnsmasq, dnsutils]
-        state: present
-
-    - name: Deploy dnsmasq config for the lab domain
-      ansible.builtin.template:
-        src: templates/dnsmasq.conf.j2
-        dest: /etc/dnsmasq.d/tiket.conf
-        mode: "0644"
-      notify: restart dnsmasq
-
-    - name: Stop dhclient from rewriting resolv.conf on lease renewal
-      # Same reason as the webs: resolv.conf must stay at 127.0.0.1 or
-      # this host loses its own dnsmasq (and apt falls back to NAT).
-      ansible.builtin.copy:
-        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
-        mode: "0644"
-        content: |
-          #!/bin/sh
-          # Lab DNS is static; never let dhclient-script touch resolv.conf.
-          make_resolv_conf() { :; }
-
-    - name: Point lb's own resolver at dnsmasq
-      ansible.builtin.copy:
-        dest: /etc/resolv.conf
-        content: |
-          nameserver 127.0.0.1
-
-    - name: Deploy load balancer config (backends by DNS name)
-      ansible.builtin.template:
-        src: templates/loadbalancer.conf.j2
-        dest: /etc/nginx/conf.d/loadbalancer.conf
-        mode: "0644"
-      notify: restart nginx
-
-    - name: Remove default site (it would shadow our config on port 80)
+    - name: Create the k3s config directory
       ansible.builtin.file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-      notify: restart nginx
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0700"
 
-  # Handler order matters: dnsmasq must be up before nginx restarts,
-  # because nginx resolves the upstream names at (re)start time.
+    - name: Write the containerd registry config
+      ansible.builtin.template:
+        src: templates/registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0600"
+      no_log: true
+      notify: restart k3s-agent
+
+    - name: Find the host-only interface (carries the private IP)
+      ansible.builtin.shell: ip -o -4 addr show to {{ private_ip }} | awk '{print $2}'
+      register: k3s_iface_raw
+      changed_when: false
+
+    - name: Record the k3s interface
+      ansible.builtin.set_fact:
+        k3s_iface: "{{ k3s_iface_raw.stdout | trim }}"
+
+    - name: Fail when the host-only interface was not found
+      ansible.builtin.assert:
+        that: k3s_iface | length > 0
+        fail_msg: no interface owns {{ private_ip }} — cannot pick flannel-iface
+
+    - name: Read the join token off the control plane
+      # Delegated read, NOT a same-run cross-play fact: `vagrant provision`
+      # runs the playbook once per machine with --limit, so facts set in the
+      # lb play are never visible in this play.
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_node_token_b64
+      delegate_to: lb
+      no_log: true
+
+    - name: Decode the join token
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_node_token_b64.content | b64decode | trim }}"
+      no_log: true
+    - name: Install k3s agent and join the cluster
+      # --node-ip pins the advertised address to the host-only network for
+      # the same reason as the server flags.
+      ansible.builtin.shell: >-
+        curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=stable sh -s - agent
+        --server https://{{ hostvars['lb']['private_ip'] }}:6443
+        --token {{ k3s_node_token }}
+        --node-ip {{ private_ip }}
+        --flannel-iface {{ k3s_iface }}
+      no_log: true
+
   handlers:
-    - name: restart dnsmasq
-      ansible.builtin.service:
-        name: dnsmasq
-        state: restarted
-
-    - name: restart nginx
-      ansible.builtin.service:
-        name: nginx
+    - name: restart k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
         state: restarted

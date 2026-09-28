@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tiket-app
+  labels:
+    app: tiket-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tiket-app
+  template:
+    metadata:
+      labels:
+        app: tiket-app
+    spec:
+      # One pod per worker node — preserves the old "one container per web VM"
+      # load-balancing demo (greeting alternates web1/web2).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: tiket-app
+      containers:
+        - name: tiket-app
+          image: "{{ registry_host }}/tiket-app:{{ app_version }}"
+          # `latest` is a moving tag CI re-pushes; containerd must re-pull.
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: tiket-app-env
+          env:
+            # socket.gethostname() would return the pod name; the app prefers
+            # this so the greeting and visits.host keep saying web1/web2.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
