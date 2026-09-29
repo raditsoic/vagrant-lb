@@ -123,7 +123,6 @@
       notify: restart k3s
 
     - name: Find the host-only interface (carries the private IP)
-      # Never hardcode: generic/debian12 may name it eth1 or enp0s8.
       ansible.builtin.shell: ip -o -4 addr show to {{ private_ip }} | awk '{print $2}'
       register: k3s_iface_raw
       changed_when: false
@@ -207,30 +206,6 @@
       ansible.builtin.apt:
         name: [curl, dnsutils]
         state: present
-
-    - name: Stop the docker daemon (k3s containerd replaces it)
-      # Teardown for VMs provisioned by the earlier docker-based play. On
-      # freshly built machines systemd reports the unit as missing —
-      # tolerated here by design.
-      ansible.builtin.systemd:
-        name: docker
-        state: stopped
-        enabled: false
-      failed_when: false
-
-    - name: Remove docker and its Python SDK
-      ansible.builtin.apt:
-        name: [docker.io, python3-docker]
-        state: absent
-
-    - name: Remove the old container-era config files
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/docker/daemon.json
-        - /root/tiket-deploy.env
-        - /root/tiket-app.env
 
     - name: Stop dhclient from rewriting resolv.conf on lease renewal
       # Same reason as on lb: the copy below must stay authoritative no
